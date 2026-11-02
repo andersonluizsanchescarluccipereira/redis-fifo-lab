@@ -1,481 +1,375 @@
-# Laboratório de Engenharia de Sistemas — Redis FIFO com Python
+# Lab 02 — Redis Pub/Sub com Python
 
-**Tema:** Mensageria, processamento assíncrono, concorrência e observabilidade.
+> **Mensageria orientada a eventos:** publishers, múltiplos subscribers, canais, assinaturas por padrão (`PSUBSCRIBE`), fan-out e comportamento durante desconexões.
 
-**Stack:** Python 3.11 · Redis · Docker Compose · HTML5 · JavaScript
+**Stack:** Python 3.11 · Redis · Docker Compose · `redis-py`  
+**Ambiente utilizado:** macOS Big Sur 11.7.11 (Intel x86_64)  
+**Pré-requisito conceitual:** [Lab 01 — Fila FIFO com Redis](https://github.com/andersonluizsanchescarluccipereira/redis-fifo-lab)
 
-**Ambiente:** macOS Big Sur 11.7.11 — Intel x86_64
+## 1. Objetivo
 
-**Nível:** Intermediário → Avançado
+Construir um laboratório reproduzível para analisar o modelo **Publish/Subscribe (Pub/Sub)** do Redis e compará-lo à fila FIFO implementada com Redis Lists.
 
----
+Ao concluir, você deverá conseguir:
 
-## 1. Objetivo do laboratório
+- Publicar eventos em canais, como `pedido.criado` e `pedido.cancelado`.
+- Manter vários subscribers independentes ouvindo o mesmo canal (**fan-out**).
+- Roteá-los por canal exato (`SUBSCRIBE`) ou padrão glob (`PSUBSCRIBE 'pedido.*'`).
+- Verificar quantos assinantes estão conectados e inspecionar métricas auxiliares.
+- Demonstrar que uma publicação feita enquanto um subscriber está desconectado **não é reentregue** quando ele volta.
+- Explicar a diferença entre entrega ao subscriber, processamento de negócio e confirmação (**ACK**).
 
-Implementar e analisar uma fila FIFO (*First In, First Out*) utilizando Redis como infraestrutura de mensageria e Python para publicação e processamento de mensagens.
+> **Escopo:** este laboratório demonstra comunicação em tempo real, não mensageria durável. Redis Pub/Sub é **at-most-once**: não armazena eventos para replay e não possui ACK nativo.
 
-O laboratório permitirá observar:
+## 2. Arquitetura
 
-- A publicação de mensagens em uma fila.
-- O consumo assíncrono por um ou mais workers.
-- A transferência atômica de mensagens entre listas Redis.
-- A confirmação de processamento por meio de ACK.
-- O comportamento do backlog quando a taxa de entrada supera a capacidade de processamento.
-- A diferença entre ordem de retirada e ordem de conclusão.
-- As limitações de confiabilidade de uma implementação baseada em Redis Lists.
+```mermaid
+flowchart TD
+    P[Publisher Python] -->|PUBLISH pedido.criado| R[(Redis Pub/Sub)]
+    R -->|SUBSCRIBE pedido.criado| N[Notificações]
+    R -->|PSUBSCRIBE pedido.*| A[Analytics]
+    R -->|SUBSCRIBE pedido.criado| U[Auditoria — demo]
+    P -->|PUBLISH pedido.cancelado| R
+```
 
-**Resultado esperado:** um sistema funcional de processamento assíncrono com dashboard de observabilidade atualizado aproximadamente a cada segundo.
+Uma publicação em `pedido.criado` chega a **todos** os subscribers conectados que assinam esse canal, inclusive por padrão. Uma publicação em `pedido.cancelado` chega ao subscriber `analytics`, que acompanha `pedido.*`.
 
-## 2. Arquitetura do laboratório
+**Observação:** o serviço “Auditoria” é apenas um nome didático. Pub/Sub **não deve ser a única fonte de uma trilha de auditoria**, pois eventos podem ser perdidos em desconexões.
+
+### Redis Lists FIFO × Redis Pub/Sub
+
+| Propriedade | Lists FIFO (Lab 01) | Pub/Sub (Lab 02) |
+|---|---|---|
+| Finalidade | Distribuir trabalho entre consumidores | Transmitir eventos aos assinantes ativos |
+| Entrega | Um consumidor retira cada item da lista | Todos os assinantes correspondentes recebem a publicação |
+| Armazenamento | Mensagens ficam na lista até serem removidas | O canal não mantém histórico de mensagens |
+| Subscriber desconectado | Pode consumir itens ainda presentes depois | Perde as publicações ocorridas durante a ausência |
+| ACK | Implementado pelo laboratório anterior | Não existe ACK nativo |
+| Replay | Depende da implementação | Não existe no Pub/Sub clássico |
+
+## 3. Estrutura de arquivos
+
+Este README documenta os arquivos já utilizados e os scripts acrescentados na segunda etapa:
 
 ```text
-              PRODUTOR PYTHON
-                    |
-                    | RPUSH
-                    v
-          +-------------------+
-          | Redis             |
-          | fila:pendentes    |
-          +-------------------+
-                    |
-                    | BLMOVE
-                    v
-          +-------------------+
-          | Redis             |
-          | fila:processando  |
-          +-------------------+
-                    |
-                    v
-              CONSUMIDOR
-                    |
-                    | Processamento
-                    | ACK (Lua)
-                    v
-          +-------------------+
-          | Redis             |
-          | metricas:pedidos  |
-          +-------------------+
-                    |
-                    | HGETALL / LLEN
-                    v
-             PAINEL HTTP
-                    |
-                    v
-          http://localhost:8080
+redis-fifo-lab/              # ou o diretório escolhido para a branch
+├── publicador.py            # exemplo inicial, já testado
+├── assinante.py             # exemplo inicial, já testado
+├── publicador_eventos.py    # publisher parametrizável, com métricas
+├── assinante_eventos.py     # subscriber parametrizável, com métricas
+├── docker-compose.yml       # ou compose.yaml: serviço chamado redis
+└── README.md
 ```
 
-O Redis atua como intermediário entre produtores e consumidores, desacoplando a publicação do processamento.
+Os arquivos `publicador_eventos.py` e `assinante_eventos.py` são os da **etapa 2** do laboratório. Os exemplos anteriores (`publicador.py` e `assinante.py`) podem ser mantidos para comparação. **O dashboard de Pub/Sub ainda não faz parte desta etapa**; sua implementação está no roadmap.
 
-O consumidor utiliza uma operação bloqueante para aguardar mensagens sem realizar consultas repetitivas e desnecessárias.
+## 4. Requisitos e instalação
 
-## 3. Preparação do ambiente
+- Python **3.11** (ou outra versão suportada pelo `redis-py` instalado).
+- Docker com Docker Compose.
+- Redis disponível em `localhost:6379`.
+- Biblioteca Python `redis`; **não é necessário instalar Streamlit, Pandas ou PyArrow**.
 
-### Etapa 1 — Acessar o projeto
-
-Abra o terminal e entre no diretório do laboratório:
+### 4.1. Verifique a branch de trabalho
 
 ```bash
-cd ~/python/redis_fifo_python
+git branch --show-current
 ```
 
-Confirme os arquivos disponíveis:
+> Execute as atividades na branch destinada ao Lab 02; não é preciso alterar o histórico da branch `main`.
 
-```bash
-ls -la
-```
+### 4.2. Inicie o Redis
 
-Arquivos esperados:
-
-| Arquivo | Responsabilidade |
-|---|---|
-| `common.py` | Conexão Redis e definição das chaves |
-| `produtor.py` | Publicação de mensagens |
-| `consumidor.py` | Processamento e confirmação |
-| `painel_simples.py` | API HTTP e dashboard |
-| `docker-compose.yml` | Infraestrutura Redis |
-| `requirements.txt` | Dependências Python |
-
-O arquivo `painel.py` baseado em Streamlit não será utilizado.
-
-### Etapa 2 — Iniciar o Redis
-
-Execute:
+A partir da raiz do projeto, onde está o arquivo de Compose:
 
 ```bash
 docker compose up -d
-```
-
-Verifique se o contêiner está ativo:
-
-```bash
 docker compose ps
-```
-
-Teste a comunicação:
-
-```bash
 docker compose exec redis redis-cli PING
 ```
 
-**Resultado esperado:**
+**Saída esperada do último comando:** `PONG`.
 
-```text
-PONG
-```
+> Se o container Redis já estiver em execução, não é necessário subir outra instância. Os comandos acima pressupõem que o serviço no Compose se chama `redis`.
 
-Se o comando retornar `PONG`, o Redis está respondendo corretamente.
+### 4.3. Ative o ambiente virtual e instale a dependência
 
-### Etapa 3 — Preparar o Python
-
-Como você já possui um ambiente virtual, ative-o:
+Caso já exista a pasta `venv`:
 
 ```bash
 source venv/bin/activate
 ```
 
-Se o diretório do ambiente virtual for `.venv`, utilize:
+Caso ainda não exista:
 
 ```bash
-source .venv/bin/activate
+python3 -m venv venv
+source venv/bin/activate
 ```
 
-Confirme:
+Instale apenas a biblioteca necessária:
 
 ```bash
-python3 --version
+python3 -m pip install 'redis>=5,<8'
+python3 -c 'import redis; print(redis.Redis(host="localhost", port=6379).ping())'
 ```
 
-Resultado esperado:
+**Saída esperada:** `True`.
 
-```text
-Python 3.11.10
-```
+## 5. Experimento A — Fan-out em um único canal
 
-Instale somente a biblioteca Redis:
+Abra **quatro terminais**, cada um no diretório do projeto e com o ambiente virtual ativado. Inicie os três subscribers antes do publisher.
+
+**Terminal 1 — Notificações:**
 
 ```bash
-python3 -m pip install "redis>=5,<8"
+python3 assinante_eventos.py --nome notificacoes --canal pedido.criado
 ```
 
-Não instale Streamlit, Pandas ou PyArrow.
-
-### Etapa 4 — Verificar a conexão Python com Redis
-
-Execute:
+**Terminal 2 — Analytics (assinatura por padrão):**
 
 ```bash
-python3 -c "from common import client; print(client().ping())"
+python3 assinante_eventos.py --nome analytics --padrao 'pedido.*'
 ```
 
-**Resultado esperado:**
-
-```text
-True
-```
-
-Se retornar `True`, a aplicação Python está conectada ao Redis.
-
----
-
-## 4. Execução do laboratório
-
-Abra três terminais no diretório do projeto. Ative o ambiente virtual em cada um deles.
-
-### Terminal 1 — Observabilidade
-
-Inicie o dashboard:
+**Terminal 3 — Auditoria didática:**
 
 ```bash
-python3 painel_simples.py
+python3 assinante_eventos.py --nome auditoria --canal pedido.criado
 ```
 
-Abra no navegador:
-
-**http://localhost:8080**
-
-O painel apresentará quatro indicadores:
-
-| Indicador | Significado |
-|---|---|
-| Publicadas | Total de mensagens enviadas |
-| Concluídas | Total de mensagens confirmadas |
-| Aguardando | Mensagens disponíveis para consumo |
-| Processando | Mensagens retiradas, ainda sem ACK |
-
-Os gráficos apresentam a taxa de publicação, a taxa de conclusão e a profundidade das filas.
-
-### Terminal 2 — Processamento
-
-Inicie um consumidor:
+**Terminal 4 — Publisher:**
 
 ```bash
-python3 consumidor.py --tempo 0.8
+python3 publicador_eventos.py --canal pedido.criado --quantidade 5 --intervalo 1
 ```
-
-O parâmetro `--tempo 0.8` representa o tempo simulado de processamento de cada mensagem, em segundos.
-
-Capacidade teórica aproximada:
-
-**1 ÷ 0,8 = 1,25 mensagem/segundo**
-
-O consumidor permanecerá aguardando novas mensagens quando a fila estiver vazia.
-
-### Terminal 3 — Publicação
-
-Execute:
-
-```bash
-python3 produtor.py --quantidade 100 --intervalo 0.2
-```
-
-Parâmetros:
-
-- `--quantidade 100`: publica 100 mensagens.
-- `--intervalo 0.2`: aguarda 200 milissegundos entre publicações.
-
-Taxa aproximada de entrada:
-
-**1 ÷ 0,2 = 5 mensagens/segundo**
 
 ### Resultado esperado
 
-Durante a publicação:
+Se os três subscribers já estiverem conectados e não houver falhas:
 
-- O contador de mensagens publicadas aumenta.
-- A fila de pendentes cresce.
-- O consumidor processa mensagens continuamente.
-- A taxa de publicação supera a capacidade de conclusão.
+| Subscriber | Eventos recebidos |
+|---|---:|
+| `notificacoes` | 5 |
+| `analytics` | 5 |
+| `auditoria` | 5 |
 
-Após o produtor terminar:
+O mesmo evento pode ser recebido pelos três processos. Isso é **fan-out**, não balanceamento de carga entre workers.
 
-- A publicação de novas mensagens é interrompida.
-- O consumidor continua trabalhando.
-- O backlog diminui progressivamente.
-- A fila eventualmente fica vazia, se não houver novas mensagens ou falhas.
+O valor retornado por `PUBLISH` informa o número de assinaturas/clientes alcançados naquele momento; **não confirma que a lógica de negócio foi executada**.
 
-Esses resultados pressupõem uma fila inicialmente vazia e um consumidor funcionando normalmente.
+## 6. Experimento B — Canais e roteamento com `PSUBSCRIBE`
 
----
-
-## 5. Experimento A — Análise de throughput e backlog
-
-**Objetivo:** compreender o comportamento de um sistema quando a taxa de chegada supera sua capacidade de processamento.
-
-Taxa de chegada:
-
-`λ = 5 mensagens/s`
-
-Capacidade de processamento:
-
-`μ = 1,25 mensagem/s`
-
-Taxa aproximada de crescimento do backlog:
-
-`λ - μ = 3,75 mensagens/s`
-
-Durante 20 segundos, o crescimento esperado é de aproximadamente:
-
-`3,75 × 20 = 75 mensagens`
-
-Essa estimativa desconsidera pequenas variações de execução e comunicação.
-
-**Perguntas para análise:**
-
-1. Por que a fila cresce mesmo quando o consumidor está funcionando?
-2. O que acontece quando a taxa de chegada supera permanentemente a capacidade de processamento?
-3. Como estimar o tempo necessário para esvaziar o backlog?
-4. Qual a relação entre throughput, latência e utilização dos workers?
-
-## 6. Experimento B — Concorrência com múltiplos consumidores
-
-Abra um quarto terminal e execute:
+Com os mesmos subscribers ainda conectados, publique eventos de cancelamento:
 
 ```bash
-python3 consumidor.py --tempo 0.8
+python3 publicador_eventos.py --canal pedido.cancelado --quantidade 3 --intervalo 1
 ```
 
-Agora existem dois consumidores concorrentes.
+**Resultado esperado:** somente `analytics` recebe esses três eventos, porque seu padrão `pedido.*` corresponde tanto a `pedido.criado` quanto a `pedido.cancelado`.
 
-Capacidade teórica agregada:
+| Assinatura | `pedido.criado` | `pedido.cancelado` |
+|---|:---:|:---:|
+| `SUBSCRIBE pedido.criado` | ✅ | — |
+| `PSUBSCRIBE pedido.*` | ✅ | ✅ |
 
-`2 × 1,25 = 2,5 mensagens/s`
+> `PSUBSCRIBE` usa correspondência por padrão glob, **não expressões regulares**. Se um mesmo cliente assinar um canal exato e um padrão que também combine com ele, poderá receber duas notificações da mesma publicação (`message` e `pmessage`).
 
-Execute novamente o produtor:
+## 7. Inspeção com Redis CLI
+
+Execute em um terminal adicional enquanto os subscribers estiverem conectados.
+
+**Contagem de assinaturas diretas por canal:**
 
 ```bash
-python3 produtor.py --quantidade 100 --intervalo 0.2
+docker compose exec redis redis-cli PUBSUB NUMSUB pedido.criado pedido.cancelado
 ```
 
-Observe como a capacidade de processamento aumenta e a taxa de crescimento do backlog diminui.
+Com a configuração do experimento, são esperados **2 assinantes diretos** em `pedido.criado` e **0** em `pedido.cancelado`. O subscriber por padrão **não entra** nessa contagem.
 
-**Ponto arquitetural importante:** a ordem FIFO de retirada não garante a ordem FIFO de conclusão quando múltiplos consumidores trabalham simultaneamente.
-
-Uma mensagem retirada primeiro pode terminar depois de outra mensagem retirada posteriormente.
-
-## 7. Experimento C — Inspeção das estruturas Redis
-
-### Consultar mensagens aguardando
+**Quantidade de padrões únicos ativos:**
 
 ```bash
-docker compose exec redis redis-cli \
-  LLEN 'fila:{pedidos}:pendentes'
+docker compose exec redis redis-cli PUBSUB NUMPAT
 ```
 
-### Consultar mensagens em processamento
+Resultado esperado no cenário: `1` padrão único (`pedido.*`). **Não confunda `NUMPAT` com quantidade de clientes que utilizam padrões.**
+
+**Canais com assinantes diretos:**
 
 ```bash
-docker compose exec redis redis-cli \
-  LLEN 'fila:{pedidos}:processando'
+docker compose exec redis redis-cli PUBSUB CHANNELS
 ```
 
-### Consultar métricas acumuladas
+**Contadores auxiliares escritos pelos nossos scripts:**
 
 ```bash
-docker compose exec redis redis-cli \
-  HGETALL 'metricas:{pedidos}'
+docker compose exec redis redis-cli HGETALL lab:pubsub:metricas
+docker compose exec redis redis-cli HGETALL lab:pubsub:publicados:canal
+docker compose exec redis redis-cli HGETALL lab:pubsub:recebidos
+docker compose exec redis redis-cli HGETALL lab:pubsub:recebidos:canal
 ```
 
-### Visualizar as primeiras mensagens pendentes
+Esses Hashes são **instrumentação adicional do laboratório**, não são criados automaticamente pelo mecanismo Redis Pub/Sub. Contam publicações ou mensagens processadas pelo código de instrumentação; não são ACKs do broker.
 
-```bash
-docker compose exec redis redis-cli \
-  LRANGE 'fila:{pedidos}:pendentes' 0 2
+## 8. Experimento C — Desconexão e perda de eventos
+
+1. Deixe `notificacoes` e `analytics` conectados.
+2. No terminal `auditoria`, pressione **Ctrl+C** para desligar somente esse subscriber.
+3. Publique dez eventos:
+
+   ```bash
+   python3 publicador_eventos.py --canal pedido.criado --quantidade 10 --intervalo 0.5
+   ```
+
+4. Reinicie a auditoria:
+
+   ```bash
+   python3 assinante_eventos.py --nome auditoria --canal pedido.criado
+   ```
+
+5. Publique mais um evento:
+
+   ```bash
+   python3 publicador_eventos.py --canal pedido.criado --quantidade 1 --intervalo 1
+   ```
+
+### Resultado esperado
+
+- A auditoria **não recebe retroativamente** os dez eventos publicados enquanto estava desligada.
+- Depois de reconectar, ela recebe apenas **novas publicações** correspondentes ao canal.
+- Notificações e Analytics continuam recebendo os eventos enquanto permanecerem conectados.
+
+**Semântica:** Redis Pub/Sub opera em **at-most-once**. Eventos publicados para assinantes desconectados não ficam armazenados para reentrega. Um subscriber lento ou uma falha durante o tratamento da mensagem também pode produzir perda do ponto de vista da aplicação.
+
+> **Como medir perdas corretamente?** Registre IDs de eventos publicados e recebidos por subscriber e compare uma janela de teste conhecida. Não subtraia simplesmente `recebidos` de `publicados`: uma única publicação pode gerar vários recebimentos por fan-out.
+
+## 9. Modelo de evento e métricas
+
+Os scripts estendidos publicam JSON com a seguinte estrutura:
+
+```json
+{
+  "id": "uuid-da-publicacao",
+  "tipo": "pedido.criado",
+  "sequencia": 1,
+  "publicado_em": "2026-11-02T12:00:00+00:00"
+}
 ```
 
-Esses comandos permitem comparar as métricas apresentadas no dashboard com o estado real das estruturas de dados no Redis.
+- `id`: identificador da publicação, útil para rastrear eventos e identificar eventuais duplicações na instrumentação.
+- `tipo`: nome do canal/evento.
+- `sequencia`: número **local à execução do publisher**, não uma ordenação global entre produtores.
+- `publicado_em`: timestamp UTC da publicação.
 
----
-
-## 8. Experimento D — Simulação de falha
-
-**Objetivo:** identificar limitações de confiabilidade no processamento de mensagens.
-
-1. Inicie o produtor.
-2. Inicie um consumidor com processamento mais demorado.
-3. Enquanto uma mensagem estiver em processamento, interrompa o consumidor com `Ctrl+C`.
-4. Consulte as listas `PENDENTES` e `PROCESSANDO`.
-5. Reinicie o consumidor.
-6. Verifique se a mensagem interrompida foi automaticamente recuperada.
-
-**Resultado esperado:** uma mensagem transferida para `PROCESSANDO` pode permanecer nessa lista após a interrupção do consumidor.
-
-A implementação atual não possui mecanismo automático de recuperação de mensagens abandonadas.
-
-Isso demonstra por que a transferência atômica entre listas, isoladamente, não garante entrega *at-least-once*.
-
-## 9. Semântica de mensageria e garantias de processamento
-
-### FIFO — First In, First Out
-
-A primeira mensagem inserida é a primeira selecionada para retirada, considerando a operação de consumo e a ordem da lista.
-
-### ACK — Acknowledgment
-
-Confirmação de que uma mensagem foi processada com sucesso.
-
-No laboratório, o ACK utiliza um script Lua para remover a mensagem da lista de processamento e incrementar o contador de conclusões somente quando a remoção ocorre.
-
-### At-most-once
-
-Uma mensagem pode ser perdida em caso de falha, mas o mecanismo não realiza reentregas.
-
-### At-least-once
-
-O sistema tenta garantir que mensagens sejam processadas pelo menos uma vez, admitindo reentregas e possíveis duplicações.
-
-Exige recuperação de mensagens não confirmadas e políticas de retry.
-
-### Exactly-once
-
-Semântica em que os efeitos de negócio de uma mensagem ocorrem exatamente uma vez.
-
-Não é garantida automaticamente pelo Redis Lists, Redis Streams ou por um ACK isolado. Normalmente exige mecanismos adicionais, como idempotência, deduplicação e coordenação transacional.
-
-### Backpressure
-
-Mecanismo utilizado para controlar ou limitar a entrada de trabalho quando a capacidade de processamento está saturada.
-
-### DLQ — Dead Letter Queue
-
-Fila destinada a mensagens que não puderam ser processadas após as tentativas previstas.
-
-### Idempotência
-
-Propriedade que permite repetir uma operação sem produzir efeitos de negócio adicionais indevidos.
-
-É essencial em sistemas com possibilidade de reentrega de mensagens.
-
----
-
-## 10. Limitações e evolução arquitetural
-
-Esta implementação é adequada para fins didáticos, mas ainda não representa uma infraestrutura completa de mensageria para produção.
-
-Evoluções recomendadas:
-
-| Prioridade | Evolução | Objetivo |
+| Métrica / chave | Significado | Limitação |
 |---|---|---|
-| P0 | Recuperação de mensagens abandonadas | Evitar mensagens presas após falhas |
-| P0 | Idempotência | Controlar efeitos de reprocessamento |
-| P1 | Retry com backoff | Tratar falhas transitórias |
-| P1 | Dead Letter Queue | Isolar mensagens problemáticas |
-| P1 | Métricas de latência e idade da fila | Identificar degradação |
-| P2 | Limites de backlog | Aplicar backpressure |
-| P2 | Redis Streams | Utilizar consumer groups e ACK nativo |
-| P2 | Prometheus e Grafana | Evoluir a observabilidade |
+| `lab:pubsub:metricas` (`publicados`) | Contador de chamadas de publicação registradas pelo script | Instrumentação feita **após** `PUBLISH`; não é transacional com a entrega |
+| `lab:pubsub:publicados:canal` | Publicações por canal | Acumulado entre execuções, até limpeza |
+| `lab:pubsub:recebidos` | Recebimentos contabilizados por nome do subscriber | Não equivale a persistência ou ACK de negócio |
+| `lab:pubsub:recebidos:canal` | Recebimentos contabilizados por canal | Um evento pode ser contabilizado várias vezes por fan-out |
 
-O Redis foi configurado com AOF para o laboratório, mas isso não garante durabilidade absoluta nem alta disponibilidade.
+Em ambientes com múltiplas instâncias, use identidades únicas na instrumentação se precisar medir o desempenho de cada processo separadamente.
 
-A política de expiração `EXPIRE` aplica-se à chave Redis inteira, não individualmente às mensagens de uma lista.
+## 10. Garantias, limitações e trade-offs
 
-O dashboard atual mantém seu histórico no navegador. Portanto, os gráficos de taxa dependem da frequência de atualização e não representam um histórico persistente de métricas.
+**O que este laboratório demonstra:**
 
-## 11. Critérios de conclusão
+- Comunicação desacoplada entre publisher e subscribers.
+- Distribuição *fan-out* para assinantes conectados.
+- Roteamento por canal e por padrão.
+- Ausência de replay do Pub/Sub clássico após desconexões.
+- Instrumentação mínima com estruturas Hash do Redis.
 
-O laboratório será considerado concluído quando você conseguir:
+**O que ele não garante:**
 
-- [ ] Inicializar o Redis pelo Docker Compose.
-- [ ] Validar a conexão com Python.
-- [ ] Publicar 100 mensagens.
-- [ ] Processar mensagens com um consumidor.
-- [ ] Observar o crescimento e a redução do backlog.
-- [ ] Executar dois consumidores simultaneamente.
-- [ ] Inspecionar as listas Redis pelo CLI.
-- [ ] Simular uma interrupção do consumidor.
-- [ ] Identificar mensagens não confirmadas.
-- [ ] Explicar as limitações de entrega e recuperação.
+- Entrega durável ou *at-least-once*.
+- ACK nativo e recuperação automática de eventos perdidos.
+- Exatamente uma execução de efeitos de negócio.
+- Histórico de eventos no canal.
+- Uma trilha de auditoria confiável baseada apenas em Pub/Sub.
 
-## 12. Encerramento e limpeza
+**Cenários adequados:** notificações transitórias, atualização de interfaces em tempo real e invalidação de cache, quando a perda de algumas notificações for tolerável ou existir reconciliação com uma fonte persistente.
 
-Interrompa o produtor, os consumidores e o dashboard utilizando `Ctrl+C`.
+**Se a perda de eventos for inaceitável:** registre o estado em um armazenamento durável e considere **Redis Streams com Consumer Groups**, ou outra plataforma de mensageria compatível com os requisitos de entrega, retenção e operação.
 
-Para parar o Redis preservando os volumes:
+## 11. Troubleshooting
+
+**`Connection refused` ou Redis indisponível**
+
+```bash
+docker compose ps
+docker compose exec redis redis-cli PING
+```
+
+**Nenhum evento aparece no subscriber**
+
+- Inicie os subscribers **antes** do publisher; não há replay.
+- Confira se o canal publicado é o mesmo canal assinado.
+- Use aspas em padrões como `'pedido.*'` para impedir expansão pelo shell.
+- Confira se ambos estão conectados à mesma instância Redis.
+
+**`ModuleNotFoundError: No module named 'redis'`**
+
+```bash
+source venv/bin/activate
+python3 -m pip install 'redis>=5,<8'
+```
+
+**Contadores não começaram em zero**
+
+As métricas são acumuladas em Hashes separados. Para zerar **somente as métricas deste Lab 02**, sem tocar nas filas do Lab 01:
+
+```bash
+docker compose exec redis redis-cli DEL \
+  lab:pubsub:metricas \
+  lab:pubsub:publicados:canal \
+  lab:pubsub:recebidos \
+  lab:pubsub:recebidos:canal
+```
+
+> Não use `FLUSHALL` para limpar este experimento se outros laboratórios compartilham o Redis.
+
+## 12. Próximas evoluções
+
+- [x] **Etapa 1:** publisher e três subscribers no terminal.
+- [ ] **Etapa 2:** validar dois canais e assinatura `pedido.*`.
+- [ ] **Etapa 3:** registrar evidências do experimento de desconexão.
+- [ ] **Etapa 4:** dashboard HTML + HTTP com publicações/s, recebimentos por subscriber e canais ativos (sem Streamlit).
+- [ ] **Etapa 5:** testes automatizados, múltiplos publishers e cenários de falha.
+- [ ] **Lab 03:** Redis Streams com `XADD`, `XREADGROUP`, `XACK`, `XPENDING` e `XAUTOCLAIM`.
+
+> Atualize as caixas do checklist à medida que **você executar e validar** os experimentos. Os itens pendentes não devem ser interpretados como funcionalidades já concluídas.
+
+## 13. Finalização e versionamento
+
+Para interromper os subscribers, pressione `Ctrl+C`. Se o Redis foi iniciado apenas para este laboratório, pare-o com:
 
 ```bash
 docker compose down
 ```
 
-Para remover também os volumes de dados:
+Esse comando preserva o volume. **Evite `docker compose down -v`** se houver mensagens ou dados de outros laboratórios que você deseje preservar.
+
+Para registrar somente o README na branch atual:
 
 ```bash
-docker compose down -v
+git status
+git add README.md
+git commit -m "docs: document Redis PubSub lab and experiments"
+git push -u origin "$(git branch --show-current)"
 ```
 
-**Atenção:** o segundo comando remove os volumes do projeto, incluindo as mensagens e métricas persistidas no Redis.
+Não é necessário `git push --force`.
+
+## Referências
+
+- [Redis — Pub/Sub: conceitos e casos de uso](https://redis.io/docs/latest/develop/use-cases/pub-sub/)
+- [Redis — Exemplo Pub/Sub com redis-py](https://redis.io/docs/latest/develop/use-cases/pub-sub/redis-py/)
+- [Redis — PUBSUB NUMSUB](https://redis.io/docs/latest/commands/pubsub-numsub/)
+- [Redis — PUBSUB NUMPAT](https://redis.io/docs/latest/commands/pubsub-numpat/)
+- [redis-py](https://redis-py.readthedocs.io/)
 
 ---
 
-## 13. Próximo nível — Redis Streams
-
-Após concluir o laboratório, a evolução natural será implementar a mesma arquitetura com Redis Streams:
-
-- `XADD` — publicação.
-- `XGROUP CREATE` — criação de grupo.
-- `XREADGROUP` — consumo.
-- `XACK` — confirmação.
-- `XPENDING` — inspeção de mensagens pendentes.
-- `XAUTOCLAIM` — recuperação de mensagens não confirmadas.
-
-O objetivo será comparar as garantias de processamento, a concorrência, a recuperação de falhas e a complexidade operacional de Redis Lists e Redis Streams.
-
-**Competências desenvolvidas:** sistemas distribuídos, mensageria assíncrona, estruturas de dados Redis, processamento concorrente, observabilidade, tolerância a falhas e análise de desempenho.
+**Aprendizado central:** Redis Pub/Sub resolve a **distribuição de eventos para assinantes conectados**. Ele não substitui uma fila durável quando o requisito é recuperar mensagens após falhas ou desconexões.
